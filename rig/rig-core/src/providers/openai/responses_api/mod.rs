@@ -1179,11 +1179,25 @@ pub enum Output {
         #[serde(default)]
         status: Option<ToolStatus>,
     },
+    /// OpenAI's hosted `web_search` tool output — executed server-side by OpenAI.
+    /// The search results are injected into the conversation context automatically;
+    /// no content needs to be extracted from this variant.
+    WebSearchCall {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        status: Option<ToolStatus>,
+        #[serde(flatten)]
+        extra: serde_json::Value,
+    },
 }
 
 impl From<Output> for Vec<completion::AssistantContent> {
     fn from(value: Output) -> Self {
         let res: Vec<completion::AssistantContent> = match value {
+            // web_search_call is executed server-side — results are injected into
+            // the conversation automatically by the API, nothing to extract here.
+            Output::WebSearchCall { .. } => vec![],
             Output::Message(OutputMessage { content, .. }) => content
                 .into_iter()
                 .map(completion::AssistantContent::from)

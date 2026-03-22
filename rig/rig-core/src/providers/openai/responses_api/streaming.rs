@@ -357,6 +357,8 @@ where
                                         StreamingItemDoneOutput { item: Output::Message(msg), .. } => {
                                             yield Ok(streaming::RawStreamingChoice::MessageId(msg.id.clone()));
                                         }
+                                        // web_search_call is executed server-side — nothing to stream
+                                        StreamingItemDoneOutput { item: Output::WebSearchCall { .. }, .. } => {}
                                     }
                                 }
                                 ItemChunkKind::OutputTextDelta(delta) => {
