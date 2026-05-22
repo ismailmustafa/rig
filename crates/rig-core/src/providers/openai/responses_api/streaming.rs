@@ -1323,7 +1323,17 @@ mod tests {
                 "type": "web_search_call",
                 "id": "ws_123",
                 "status": "completed",
-                "queries": ["rust async streams"]
+                "action": {
+                    "type": "search",
+                    "query": "AI customer discovery best practices",
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://example.com/article",
+                            "title": "Example Article"
+                        }
+                    ]
+                }
             }
         });
         let body = sse_body_from_events(std::slice::from_ref(&event));
@@ -1341,6 +1351,14 @@ mod tests {
         assert_eq!(provider_event.sequence_number, Some(8));
         assert_eq!(provider_event.status.as_deref(), Some("completed"));
         assert_eq!(provider_event.raw, event);
+        assert_eq!(
+            provider_event.raw["item"]["action"]["sources"][0]["url"],
+            "https://example.com/article"
+        );
+        assert_eq!(
+            provider_event.raw["item"]["action"]["sources"][0]["title"],
+            "Example Article"
+        );
     }
 
     #[test]
@@ -1447,10 +1465,26 @@ mod tests {
     #[tokio::test]
     async fn stream_surfaces_provider_events_to_callers() {
         let event = json!({
-            "type": "response.web_search_call.completed",
+            "type": "response.output_item.done",
             "sequence_number": 4,
             "item_id": "ws_123",
-            "status": "completed"
+            "output_index": 0,
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_123",
+                "status": "completed",
+                "action": {
+                    "type": "search",
+                    "query": "AI customer discovery best practices",
+                    "sources": [
+                        {
+                            "type": "url",
+                            "url": "https://example.com/article",
+                            "title": "Example Article"
+                        }
+                    ]
+                }
+            }
         });
         let mut response = sample_response(ResponseStatus::Completed);
         response.usage = Some(ResponsesUsage {
@@ -1485,14 +1519,19 @@ mod tests {
         };
 
         assert_eq!(provider_event.provider, "openai");
-        assert_eq!(
-            provider_event.event_type,
-            "response.web_search_call.completed"
-        );
+        assert_eq!(provider_event.event_type, "response.output_item.done");
         assert_eq!(provider_event.item_id.as_deref(), Some("ws_123"));
         assert_eq!(provider_event.sequence_number, Some(4));
         assert_eq!(provider_event.status.as_deref(), Some("completed"));
         assert_eq!(provider_event.raw, event);
+        assert_eq!(
+            provider_event.raw["item"]["action"]["sources"][0]["url"],
+            "https://example.com/article"
+        );
+        assert_eq!(
+            provider_event.raw["item"]["action"]["sources"][0]["title"],
+            "Example Article"
+        );
     }
 
     #[test]

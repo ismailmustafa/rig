@@ -1273,6 +1273,8 @@ pub enum Include {
     ReasoningEncryptedContent,
     #[serde(rename = "code_interpreter_call.outputs")]
     CodeInterpreterCallOutputs,
+    #[serde(rename = "web_search_call.action.sources")]
+    WebSearchCallActionSources,
 }
 
 /// A provider-native hosted tool output item.
@@ -2099,11 +2101,17 @@ mod tests {
             "type": "web_search_call",
             "id": "ws_123",
             "status": "completed",
-            "queries": ["rust async streams"],
-            "results": [{
-                "title": "Rust",
-                "url": "https://www.rust-lang.org/"
-            }]
+            "action": {
+                "type": "search",
+                "query": "AI customer discovery best practices",
+                "sources": [
+                    {
+                        "type": "url",
+                        "url": "https://example.com/article",
+                        "title": "Example Article"
+                    }
+                ]
+            }
         });
 
         let response: CompletionResponse = serde_json::from_value(response_with_output(vec![
@@ -2129,6 +2137,14 @@ mod tests {
         assert_eq!(output.r#type, "web_search_call");
         assert_eq!(output.status.as_deref(), Some("completed"));
         assert_eq!(output.raw, web_search_call);
+        assert_eq!(
+            output.raw["action"]["sources"][0]["url"],
+            "https://example.com/article"
+        );
+        assert_eq!(
+            output.raw["action"]["sources"][0]["title"],
+            "Example Article"
+        );
 
         let content = response
             .output
@@ -2148,7 +2164,8 @@ mod tests {
         assert!(matches!(
             converted.raw_response.output.get(1),
             Some(Output::ProviderHostedTool(output))
-                if output.raw["results"][0]["url"] == "https://www.rust-lang.org/"
+                if output.raw["action"]["sources"][0]["url"] == "https://example.com/article"
+                    && output.raw["action"]["sources"][0]["title"] == "Example Article"
         ));
     }
 
@@ -2234,6 +2251,41 @@ mod tests {
             ))
             .expect("provider-specific service tier should serialize"),
             json!("provider_experimental")
+        );
+    }
+
+    #[test]
+    fn web_search_sources_include_serializes_expected_string() {
+        assert_eq!(
+            serde_json::to_value(Include::WebSearchCallActionSources)
+                .expect("include should serialize"),
+            json!("web_search_call.action.sources")
+        );
+
+        let additional_parameters = AdditionalParameters {
+            include: Some(vec![Include::WebSearchCallActionSources]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(additional_parameters)
+                .expect("additional parameters should serialize"),
+            json!({
+                "include": ["web_search_call.action.sources"]
+            })
+        );
+
+        let additional_parameters: AdditionalParameters = serde_json::from_value(json!({
+            "include": ["web_search_call.action.sources"]
+        }))
+        .expect("additional parameters should deserialize");
+
+        assert_eq!(
+            serde_json::to_value(additional_parameters)
+                .expect("additional parameters should serialize after deserialization"),
+            json!({
+                "include": ["web_search_call.action.sources"]
+            })
         );
     }
 
