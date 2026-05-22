@@ -787,6 +787,9 @@ where
                             }
                             yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ReasoningDelta { reasoning, id }));
                         },
+                        Ok(StreamedAssistantContent::ProviderEvent(event)) => {
+                            yield Ok(MultiTurnStreamItem::stream_item(StreamedAssistantContent::ProviderEvent(event)));
+                        }
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
                             if let Some(usage) = final_resp.token_usage() {
                                 current_call_usage = reported_usage(usage);

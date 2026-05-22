@@ -11,6 +11,7 @@ use crate::wasm_compat::WasmCompatSend;
 use async_stream::stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{Level, debug, enabled, info_span};
 use tracing_futures::Instrument as _;
 
@@ -272,6 +273,8 @@ impl RawChoiceAccumulator {
         &mut self,
         item: ItemChunkKind,
         options: ResponsesStreamOptions,
+        provider_name: &str,
+        raw: Option<&Value>,
     ) -> Vec<StreamingRawChoice> {
         let mut immediate = Vec::new();
 
@@ -296,6 +299,8 @@ impl RawChoiceAccumulator {
                     message.item,
                     &mut immediate,
                     options.emits_completed_tool_calls_immediately(),
+                    provider_name,
+                    raw,
                 );
             }
             ItemChunkKind::OutputTextDelta(delta) => {
@@ -321,6 +326,23 @@ impl RawChoiceAccumulator {
                     internal_call_id,
                     content: streaming::ToolCallDeltaContent::Delta(delta.delta),
                 });
+            }
+            ItemChunkKind::OutputItemAdded(output) => {
+                push_provider_event_for_output_item(
+                    provider_name,
+                    "response.output_item.added",
+                    &output,
+                    raw,
+                    &mut immediate,
+                );
+            }
+            ItemChunkKind::Unknown => {
+                if let Some(raw) = raw
+                    && should_surface_provider_event(raw)
+                    && let Some(event) = provider_event_from_value(provider_name, raw)
+                {
+                    immediate.push(streaming::RawStreamingChoice::ProviderEvent(event));
+                }
             }
             _ => {}
         }
@@ -363,6 +385,8 @@ impl RawChoiceAccumulator {
         item: Output,
         immediate: &mut Vec<StreamingRawChoice>,
         emit_completed_tool_calls_immediately: bool,
+        provider_name: &str,
+        raw: Option<&Value>,
     ) {
         match item {
             Output::FunctionCall(func) => {
@@ -398,7 +422,44 @@ impl RawChoiceAccumulator {
             Output::Message(message) => {
                 immediate.push(streaming::RawStreamingChoice::MessageId(message.id));
             }
-            Output::Unknown => {}
+            Output::ProviderHostedTool(output) => {
+                if raw.is_some_and(|raw| !should_surface_provider_event(raw)) {
+                    return;
+                }
+
+                let event = raw
+                    .and_then(|raw| provider_event_from_value(provider_name, raw))
+                    .unwrap_or_else(|| {
+                        provider_event_from_output(
+                            provider_name,
+                            "response.output_item.done",
+                            output.id.clone(),
+                            None,
+                            output.status.clone(),
+                            output.raw,
+                        )
+                    });
+                immediate.push(streaming::RawStreamingChoice::ProviderEvent(event));
+            }
+            Output::Unknown(raw_output) => {
+                if raw.is_some_and(|raw| !should_surface_provider_event(raw)) {
+                    return;
+                }
+
+                let event = raw
+                    .and_then(|raw| provider_event_from_value(provider_name, raw))
+                    .unwrap_or_else(|| {
+                        provider_event_from_output(
+                            provider_name,
+                            "response.output_item.done",
+                            None,
+                            None,
+                            None,
+                            raw_output,
+                        )
+                    });
+                immediate.push(streaming::RawStreamingChoice::ProviderEvent(event));
+            }
         }
     }
 
@@ -411,6 +472,176 @@ impl RawChoiceAccumulator {
             },
         ));
         choices
+    }
+}
+
+fn push_provider_event_for_output_item(
+    provider_name: &str,
+    event_type: &str,
+    done_output: &StreamingItemDoneOutput,
+    raw: Option<&Value>,
+    immediate: &mut Vec<StreamingRawChoice>,
+) {
+    if raw.is_some_and(|raw| !should_surface_provider_event(raw)) {
+        return;
+    }
+
+    match &done_output.item {
+        Output::ProviderHostedTool(hosted_output) => {
+            let event = raw
+                .and_then(|raw| provider_event_from_value(provider_name, raw))
+                .unwrap_or_else(|| {
+                    provider_event_from_output(
+                        provider_name,
+                        event_type,
+                        hosted_output.id.clone(),
+                        Some(done_output.sequence_number),
+                        hosted_output.status.clone(),
+                        hosted_output.raw.clone(),
+                    )
+                });
+            immediate.push(streaming::RawStreamingChoice::ProviderEvent(event));
+        }
+        Output::Unknown(raw_output) => {
+            let event = raw
+                .and_then(|raw| provider_event_from_value(provider_name, raw))
+                .unwrap_or_else(|| {
+                    provider_event_from_output(
+                        provider_name,
+                        event_type,
+                        None,
+                        Some(done_output.sequence_number),
+                        None,
+                        raw_output.clone(),
+                    )
+                });
+            immediate.push(streaming::RawStreamingChoice::ProviderEvent(event));
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn provider_event_from_value(
+    provider_name: &str,
+    value: &Value,
+) -> Option<streaming::ProviderEvent> {
+    let event_type = value.get("type").and_then(Value::as_str)?.to_string();
+
+    Some(streaming::ProviderEvent {
+        provider: provider_id(provider_name),
+        event_type,
+        item_id: extract_item_id(value),
+        sequence_number: extract_sequence_number(value),
+        status: extract_status(value),
+        raw: value.clone(),
+    })
+}
+
+fn provider_event_from_output(
+    provider_name: &str,
+    event_type: &str,
+    item_id: Option<String>,
+    sequence_number: Option<u64>,
+    status: Option<String>,
+    raw: Value,
+) -> streaming::ProviderEvent {
+    streaming::ProviderEvent {
+        provider: provider_id(provider_name),
+        event_type: event_type.to_string(),
+        item_id,
+        sequence_number,
+        status,
+        raw,
+    }
+}
+
+pub(super) fn should_surface_provider_event(value: &Value) -> bool {
+    let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+
+    match event_type {
+        "response.output_item.added" | "response.output_item.done" => value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .map(|item_type| {
+                !matches!(item_type, "message" | "function_call")
+                    && !item_type.contains("reasoning")
+            })
+            .unwrap_or(true),
+        event_type if event_type.contains("reasoning") => false,
+        event_type if is_known_normalized_event_type(event_type) => false,
+        _ => true,
+    }
+}
+
+fn is_known_normalized_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "error"
+            | "response.created"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+    )
+}
+
+fn provider_id(provider_name: &str) -> String {
+    provider_name.to_ascii_lowercase()
+}
+
+fn extract_item_id(value: &Value) -> Option<String> {
+    value
+        .get("item_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn extract_sequence_number(value: &Value) -> Option<u64> {
+    value
+        .get("sequence_number")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("sequence_number"))
+                .and_then(Value::as_u64)
+        })
+}
+
+fn extract_status(value: &Value) -> Option<String> {
+    value
+        .get("status")
+        .or_else(|| value.get("item").and_then(|item| item.get("status")))
+        .and_then(json_value_to_string)
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        value => Some(value.to_string()),
     }
 }
 
@@ -432,10 +663,17 @@ pub(crate) fn raw_choices_from_sse_body(
             continue;
         }
 
+        let value = serde_json::from_str::<Value>(data).ok();
+
         if let Ok(chunk) = serde_json::from_str::<StreamingCompletionChunk>(data) {
             match chunk {
                 StreamingCompletionChunk::Delta(chunk) => {
-                    raw_choices.extend(accumulator.decode_item_chunk(chunk.data, options));
+                    raw_choices.extend(accumulator.decode_item_chunk(
+                        chunk.data,
+                        options,
+                        provider_name,
+                        value.as_ref(),
+                    ));
                 }
                 StreamingCompletionChunk::Response(chunk) => {
                     let ResponseChunk { kind, response, .. } = *chunk;
@@ -445,9 +683,8 @@ pub(crate) fn raw_choices_from_sse_body(
             continue;
         }
 
-        let value = match serde_json::from_str::<serde_json::Value>(data) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Some(value) = value else {
+            continue;
         };
 
         match value.get("type").and_then(serde_json::Value::as_str) {
@@ -469,18 +706,31 @@ pub(crate) fn raw_choices_from_sse_body(
                     .get("item")
                     .cloned()
                     .and_then(|item| serde_json::from_value::<Output>(item).ok())
-                    && let Output::FunctionCall(func) = item
                 {
-                    let internal_call_id = accumulator
-                        .tool_call_internal_ids
-                        .entry(func.id.clone())
-                        .or_insert_with(|| nanoid::nanoid!())
-                        .clone();
-                    raw_choices.push(streaming::RawStreamingChoice::ToolCallDelta {
-                        id: func.id,
-                        internal_call_id,
-                        content: streaming::ToolCallDeltaContent::Name(func.name),
-                    });
+                    match item {
+                        Output::FunctionCall(func) => {
+                            let internal_call_id = accumulator
+                                .tool_call_internal_ids
+                                .entry(func.id.clone())
+                                .or_insert_with(|| nanoid::nanoid!())
+                                .clone();
+                            raw_choices.push(streaming::RawStreamingChoice::ToolCallDelta {
+                                id: func.id,
+                                internal_call_id,
+                                content: streaming::ToolCallDeltaContent::Name(func.name),
+                            });
+                        }
+                        Output::ProviderHostedTool(_) | Output::Unknown(_) => {
+                            if should_surface_provider_event(&value)
+                                && let Some(event) =
+                                    provider_event_from_value(provider_name, &value)
+                            {
+                                raw_choices
+                                    .push(streaming::RawStreamingChoice::ProviderEvent(event));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Some("response.output_item.done") => {
@@ -489,7 +739,13 @@ pub(crate) fn raw_choices_from_sse_body(
                     .cloned()
                     .and_then(|item| serde_json::from_value::<Output>(item).ok())
                 {
-                    accumulator.push_output_item_done(item, &mut raw_choices, false);
+                    accumulator.push_output_item_done(
+                        item,
+                        &mut raw_choices,
+                        false,
+                        provider_name,
+                        Some(&value),
+                    );
                 }
             }
             Some("response.function_call_arguments.delta") => {
@@ -531,7 +787,13 @@ pub(crate) fn raw_choices_from_sse_body(
                     .unwrap_or(data);
                 return Err(CompletionError::ProviderError(message.to_owned()));
             }
-            _ => {}
+            _ => {
+                if should_surface_provider_event(&value)
+                    && let Some(event) = provider_event_from_value(provider_name, &value)
+                {
+                    raw_choices.push(streaming::RawStreamingChoice::ProviderEvent(event));
+                }
+            }
         }
     }
 
@@ -653,12 +915,20 @@ where
                         continue;
                     }
 
+                    let raw_value = serde_json::from_str::<Value>(&evt.data).ok();
                     let data = serde_json::from_str::<StreamingCompletionChunk>(&evt.data);
 
                     let Ok(data) = data else {
                         let Err(err) = data else {
                             continue;
                         };
+                        if let Some(raw_value) = raw_value.as_ref()
+                            && should_surface_provider_event(raw_value)
+                            && let Some(event) = provider_event_from_value(provider_name, raw_value)
+                        {
+                            yield Ok(streaming::RawStreamingChoice::ProviderEvent(event));
+                            continue;
+                        }
                         debug!(
                             "Couldn't deserialize SSE data as StreamingCompletionChunk: {:?}",
                             err
@@ -668,7 +938,12 @@ where
 
                     match data {
                         StreamingCompletionChunk::Delta(chunk) => {
-                            for choice in accumulator.decode_item_chunk(chunk.data, options) {
+                            for choice in accumulator.decode_item_chunk(
+                                chunk.data,
+                                options,
+                                provider_name,
+                                raw_value.as_ref(),
+                            ) {
                                 yield Ok(choice);
                             }
                         }
@@ -914,7 +1189,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemChunkKind, StreamingCompletionChunk, reasoning_choices_from_done_item};
+    use super::{
+        ItemChunkKind, StreamingCompletionChunk, raw_choices_from_sse_body,
+        reasoning_choices_from_done_item,
+    };
     use crate::completion::CompletionModel;
     use crate::message::ReasoningContent;
     use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
@@ -991,6 +1269,230 @@ mod tests {
         }
 
         panic!("stream should yield a final response");
+    }
+
+    fn sse_body_from_events(events: &[serde_json::Value]) -> String {
+        events
+            .iter()
+            .map(|event| {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(event).expect("event should serialize")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_choices_surface_unknown_hosted_tool_event() {
+        let event = json!({
+            "type": "response.web_search_call.in_progress",
+            "sequence_number": 7,
+            "item_id": "ws_123",
+            "status": "in_progress",
+            "queries": ["rust async streams"]
+        });
+        let body = sse_body_from_events(std::slice::from_ref(&event));
+
+        let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new(), "OpenAI")
+            .expect("SSE body should parse");
+
+        let Some(RawStreamingChoice::ProviderEvent(provider_event)) = choices.first() else {
+            panic!("expected provider event");
+        };
+
+        assert_eq!(provider_event.provider, "openai");
+        assert_eq!(
+            provider_event.event_type,
+            "response.web_search_call.in_progress"
+        );
+        assert_eq!(provider_event.item_id.as_deref(), Some("ws_123"));
+        assert_eq!(provider_event.sequence_number, Some(7));
+        assert_eq!(provider_event.status.as_deref(), Some("in_progress"));
+        assert_eq!(provider_event.raw, event);
+    }
+
+    #[test]
+    fn raw_choices_surface_hosted_output_item_done_with_original_payload() {
+        let event = json!({
+            "type": "response.output_item.done",
+            "sequence_number": 8,
+            "item_id": "ws_123",
+            "output_index": 0,
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_123",
+                "status": "completed",
+                "queries": ["rust async streams"]
+            }
+        });
+        let body = sse_body_from_events(std::slice::from_ref(&event));
+
+        let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new(), "OpenAI")
+            .expect("SSE body should parse");
+
+        let Some(RawStreamingChoice::ProviderEvent(provider_event)) = choices.first() else {
+            panic!("expected provider event");
+        };
+
+        assert_eq!(provider_event.provider, "openai");
+        assert_eq!(provider_event.event_type, "response.output_item.done");
+        assert_eq!(provider_event.item_id.as_deref(), Some("ws_123"));
+        assert_eq!(provider_event.sequence_number, Some(8));
+        assert_eq!(provider_event.status.as_deref(), Some("completed"));
+        assert_eq!(provider_event.raw, event);
+    }
+
+    #[test]
+    fn raw_choices_keep_message_deltas_when_provider_events_are_present() {
+        let provider_event = json!({
+            "type": "response.web_search_call.completed",
+            "sequence_number": 2,
+            "item_id": "ws_123",
+            "status": "completed"
+        });
+        let completed = {
+            let mut response = sample_response(ResponseStatus::Completed);
+            response.usage = Some(ResponsesUsage {
+                input_tokens: 3,
+                input_tokens_details: None,
+                output_tokens: 4,
+                output_tokens_details: OutputTokensDetails {
+                    reasoning_tokens: 0,
+                },
+                total_tokens: 7,
+            });
+            json!({
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": response,
+            })
+        };
+        let body = sse_body_from_events(&[
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_123",
+                "output_index": 0,
+                "content_index": 0,
+                "sequence_number": 1,
+                "delta": "hello"
+            }),
+            provider_event,
+            completed,
+        ]);
+
+        let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new(), "OpenAI")
+            .expect("SSE body should parse");
+
+        assert!(matches!(
+            choices.first(),
+            Some(RawStreamingChoice::Message(text)) if text == "hello"
+        ));
+        assert!(matches!(
+            choices.get(1),
+            Some(RawStreamingChoice::ProviderEvent(event))
+                if event.event_type == "response.web_search_call.completed"
+        ));
+        assert!(matches!(
+            choices.last(),
+            Some(RawStreamingChoice::FinalResponse(response))
+                if response.usage.total_tokens == 7
+        ));
+    }
+
+    #[test]
+    fn raw_choices_do_not_surface_unknown_reasoning_events() {
+        let body = sse_body_from_events(&[
+            json!({
+                "type": "response.reasoning.private_delta",
+                "output_index": 0,
+                "sequence_number": 1,
+                "item_id": "rs_123",
+                "delta": "hidden"
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning_trace",
+                    "id": "rs_123",
+                    "status": "in_progress",
+                    "hidden": "hidden"
+                }
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning_call",
+                    "id": "rs_123",
+                    "status": "completed",
+                    "hidden": "hidden"
+                }
+            }),
+        ]);
+
+        let choices = raw_choices_from_sse_body(&body, ResponsesUsage::new(), "OpenAI")
+            .expect("SSE body should parse");
+
+        assert!(
+            choices
+                .iter()
+                .all(|choice| !matches!(choice, RawStreamingChoice::ProviderEvent(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_surfaces_provider_events_to_callers() {
+        let event = json!({
+            "type": "response.web_search_call.completed",
+            "sequence_number": 4,
+            "item_id": "ws_123",
+            "status": "completed"
+        });
+        let mut response = sample_response(ResponseStatus::Completed);
+        response.usage = Some(ResponsesUsage {
+            input_tokens: 1,
+            input_tokens_details: None,
+            output_tokens: 1,
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: 0,
+            },
+            total_tokens: 2,
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 5,
+            "response": response,
+        });
+
+        let client = openai::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[event.clone(), completed]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = client.completion_model("gpt-5.4");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        let Some(Ok(StreamedAssistantContent::ProviderEvent(provider_event))) = stream.next().await
+        else {
+            panic!("expected provider event");
+        };
+
+        assert_eq!(provider_event.provider, "openai");
+        assert_eq!(
+            provider_event.event_type,
+            "response.web_search_call.completed"
+        );
+        assert_eq!(provider_event.item_id.as_deref(), Some("ws_123"));
+        assert_eq!(provider_event.sequence_number, Some(4));
+        assert_eq!(provider_event.status.as_deref(), Some("completed"));
+        assert_eq!(provider_event.raw, event);
     }
 
     #[test]

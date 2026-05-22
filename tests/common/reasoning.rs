@@ -444,6 +444,9 @@ pub(crate) async fn collect_stream_stats<R>(
                         stats.events.push("tool_call_delta");
                     }
                 }
+                StreamedAssistantContent::ProviderEvent(_) => {
+                    stats.events.push("provider_event");
+                }
                 StreamedAssistantContent::Final(_) => {
                     stats.events.push("final");
                 }

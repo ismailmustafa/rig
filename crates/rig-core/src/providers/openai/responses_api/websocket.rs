@@ -8,7 +8,9 @@ use crate::completion::{self, CompletionError};
 use crate::http_client::HttpClientExt;
 use crate::providers::openai::responses_api::streaming::{
     ItemChunk, ResponseChunk, ResponseChunkKind, StreamingCompletionChunk,
+    provider_event_from_value, should_surface_provider_event,
 };
+use crate::streaming::ProviderEvent;
 use crate::wasm_compat::{WasmCompatSend, WasmCompatSync};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -149,11 +151,14 @@ pub enum ResponsesWebSocketDoneEventKind {
 
 /// A server event emitted by OpenAI WebSocket mode.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ResponsesWebSocketEvent {
     /// A response lifecycle event such as `response.created` or `response.completed`.
     Response(Box<ResponseChunk>),
     /// A streaming item/delta event such as `response.output_text.delta`.
     Item(ItemChunk),
+    /// Opaque provider-native event that is not normalized by Rig.
+    ProviderEvent(ProviderEvent),
     /// A protocol-level websocket error event.
     Error(ResponsesWebSocketErrorEvent),
     /// An optional `response.done` event emitted by OpenAI over WebSockets.
@@ -167,7 +172,7 @@ impl ResponsesWebSocketEvent {
         match self {
             Self::Response(chunk) => Some(&chunk.response.id),
             Self::Done(done) => done.response_id(),
-            Self::Item(_) | Self::Error(_) => None,
+            Self::Item(_) | Self::ProviderEvent(_) | Self::Error(_) => None,
         }
     }
 
@@ -182,7 +187,7 @@ impl ResponsesWebSocketEvent {
                     | ResponseChunkKind::ResponseIncomplete
             ),
             Self::Error(_) | Self::Done(_) => true,
-            Self::Item(_) => false,
+            Self::Item(_) | Self::ProviderEvent(_) => false,
         }
     }
 }
@@ -509,7 +514,7 @@ where
                 ResponsesWebSocketEvent::Error(error) => {
                     return Err(CompletionError::ProviderError(error.to_string()));
                 }
-                ResponsesWebSocketEvent::Item(_) => {}
+                ResponsesWebSocketEvent::Item(_) | ResponsesWebSocketEvent::ProviderEvent(_) => {}
             }
         }
     }
@@ -552,7 +557,7 @@ where
                 self.pending_done_response_id = None;
                 self.in_flight = false;
             }
-            ResponsesWebSocketEvent::Item(_) => {}
+            ResponsesWebSocketEvent::Item(_) | ResponsesWebSocketEvent::ProviderEvent(_) => {}
         }
     }
 
@@ -699,6 +704,12 @@ fn parse_server_event(payload: &str) -> Result<Option<ResponsesWebSocketEvent>, 
             StreamingCompletionChunk::Delta(item) => Ok(Some(ResponsesWebSocketEvent::Item(item))),
         },
         _ => {
+            let value = serde_json::from_str::<Value>(payload)?;
+            if should_surface_provider_event(&value) {
+                return Ok(provider_event_from_value("OpenAI", &value)
+                    .map(ResponsesWebSocketEvent::ProviderEvent));
+            }
+
             tracing::debug!(
                 target: "rig::completions",
                 event_type = event_type.kind.as_str(),
@@ -1721,15 +1732,39 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_type_is_skipped() {
+    fn unknown_provider_event_type_is_surfaced() {
         let payload = json!({
-            "type": "response.some_future_event",
-            "data": "hello"
+            "type": "response.web_search_call.in_progress",
+            "sequence_number": 7,
+            "item_id": "ws_123",
+            "status": "in_progress"
+        });
+
+        let result =
+            parse_server_event(&payload.to_string()).expect("provider event should not error");
+
+        let Some(ResponsesWebSocketEvent::ProviderEvent(event)) = result else {
+            panic!("expected provider event");
+        };
+
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.event_type, "response.web_search_call.in_progress");
+        assert_eq!(event.item_id.as_deref(), Some("ws_123"));
+        assert_eq!(event.sequence_number, Some(7));
+        assert_eq!(event.status.as_deref(), Some("in_progress"));
+        assert_eq!(event.raw, payload);
+    }
+
+    #[test]
+    fn unknown_reasoning_event_type_is_skipped() {
+        let payload = json!({
+            "type": "response.reasoning.private_delta",
+            "data": "hidden"
         });
 
         let result =
             parse_server_event(&payload.to_string()).expect("unknown event should not error");
-        assert!(result.is_none(), "unknown event should be skipped");
+        assert!(result.is_none(), "reasoning event should be skipped");
     }
 
     #[test]
@@ -1923,7 +1958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_event_is_skipped_during_session() {
+    async fn provider_event_is_ignored_by_completion_wait() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -1941,17 +1976,17 @@ mod tests {
                 .expect("request should exist")
                 .expect("request should be valid");
 
-            // Send an unknown event type first
+            // Send an opaque provider event first.
             socket
                 .send(Message::text(
                     json!({
                         "type": "response.some_future_event",
-                        "data": "should be skipped"
+                        "data": "should not stop completion collection"
                     })
                     .to_string(),
                 ))
                 .await
-                .expect("unknown event should send");
+                .expect("provider event should send");
 
             // Then send the real completed response
             let response = serde_json::to_value(CompletionResponse {

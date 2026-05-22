@@ -509,6 +509,9 @@ pub(crate) async fn collect_stream_observation<R>(
                 StreamedAssistantContent::ReasoningDelta { .. } => {
                     observation.events.push("reasoning_delta");
                 }
+                StreamedAssistantContent::ProviderEvent(_) => {
+                    observation.events.push("provider_event");
+                }
                 StreamedAssistantContent::Final(_) => {
                     observation.events.push("stream_final");
                 }
@@ -565,6 +568,9 @@ where
             }
             Ok(StreamedAssistantContent::ReasoningDelta { .. }) => {
                 observation.events.push("reasoning_delta");
+            }
+            Ok(StreamedAssistantContent::ProviderEvent(_)) => {
+                observation.events.push("provider_event");
             }
             Ok(StreamedAssistantContent::Final(_)) => {
                 observation.got_final = true;

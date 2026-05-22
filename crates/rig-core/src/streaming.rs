@@ -76,8 +76,31 @@ pub enum ToolCallDeltaContent {
     Delta(String),
 }
 
+/// Opaque provider-native event emitted during streaming.
+///
+/// Provider-hosted tools such as OpenAI web search run inside the provider's
+/// request lifecycle rather than Rig's tool executor. This event gives callers
+/// access to those provider-native lifecycle payloads without requiring Rig to
+/// normalize every provider-specific event type.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ProviderEvent {
+    /// Provider identifier, for example `openai`.
+    pub provider: String,
+    /// Provider-native event type string.
+    pub event_type: String,
+    /// Provider item ID associated with this event, when present.
+    pub item_id: Option<String>,
+    /// Provider sequence number associated with this event, when present.
+    pub sequence_number: Option<u64>,
+    /// Provider status associated with this event, when present.
+    pub status: Option<String>,
+    /// Original provider payload for callers that need provider-specific detail.
+    pub raw: serde_json::Value,
+}
+
 /// Enum representing a streaming chunk from the model
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RawStreamingChoice<R>
 where
     R: Clone,
@@ -125,6 +148,9 @@ where
         /// Partial reasoning text.
         reasoning: String,
     },
+
+    /// Opaque provider-native event that is not part of the assistant message.
+    ProviderEvent(ProviderEvent),
 
     /// The final response object, must be yielded if you want the
     /// `response` field to be populated on the `StreamingCompletionResponse`
@@ -491,6 +517,9 @@ where
                         id,
                         reasoning,
                     })))
+                }
+                RawStreamingChoice::ProviderEvent(event) => {
+                    Poll::Ready(Some(Ok(StreamedAssistantContent::ProviderEvent(event))))
                 }
                 RawStreamingChoice::ToolCall(raw_tool_call) => {
                     let internal_call_id = raw_tool_call.internal_call_id.clone();
@@ -904,6 +933,9 @@ mod tests {
                     println!("Reasoning delta: {reasoning}");
                     chunk_count += 1;
                 }
+                Ok(StreamedAssistantContent::ProviderEvent(event)) => {
+                    println!("Provider event: {event:?}");
+                }
                 Err(e) => {
                     eprintln!("Error: {e:?}");
                     break;
@@ -1055,6 +1087,7 @@ mod tests {
 /// Describes responses from a streamed provider response which is either text, a tool call or a final usage response.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum StreamedAssistantContent<R> {
     /// Text delta emitted by the assistant.
     Text(Text),
@@ -1082,6 +1115,8 @@ pub enum StreamedAssistantContent<R> {
         /// Partial reasoning text.
         reasoning: String,
     },
+    /// Opaque provider-native event emitted during streaming.
+    ProviderEvent(ProviderEvent),
     /// Final provider response object, if yielded by the provider stream.
     Final(R),
 }

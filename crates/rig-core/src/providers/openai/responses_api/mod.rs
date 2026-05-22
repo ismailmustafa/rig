@@ -1275,28 +1275,165 @@ pub enum Include {
     CodeInterpreterCallOutputs,
 }
 
-/// A currently non-exhaustive list of output types.
+/// A provider-native hosted tool output item.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
+pub struct ProviderHostedToolOutput {
+    /// Provider output item ID, when present.
+    pub id: Option<String>,
+    /// Provider-native output item type, for example `web_search_call`.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Provider status, when present.
+    pub status: Option<String>,
+    /// Original provider output item payload.
+    pub raw: Value,
+}
+
+impl ProviderHostedToolOutput {
+    fn from_raw(r#type: String, raw: Value) -> Self {
+        Self {
+            id: raw.get("id").and_then(Value::as_str).map(ToOwned::to_owned),
+            status: raw.get("status").and_then(value_to_string),
+            r#type,
+            raw,
+        }
+    }
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        value => Some(value.to_string()),
+    }
+}
+
+fn is_provider_hosted_tool_output_type(r#type: &str) -> bool {
+    r#type.ends_with("_call") && r#type != "function_call" && !r#type.contains("reasoning")
+}
+
+/// A currently non-exhaustive list of output types.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Output {
     Message(OutputMessage),
-    #[serde(alias = "function_call")]
     FunctionCall(OutputFunctionCall),
     Reasoning {
         id: String,
         summary: Vec<ReasoningSummary>,
-        #[serde(default)]
         encrypted_content: Option<String>,
-        #[serde(default)]
         status: Option<ToolStatus>,
     },
-    /// Catch-all variant for unknown output types (e.g., `web_search_call`,
-    /// `file_search_call`, `computer_use_call`). This prevents unknown types
-    /// from breaking deserialization of the entire `CompletionResponse`,
-    /// which previously caused streaming token usage to be silently dropped.
-    #[serde(other)]
-    Unknown,
+    /// Provider-hosted tool output such as `web_search_call`.
+    ProviderHostedTool(ProviderHostedToolOutput),
+    /// Catch-all variant for unknown output types that are not recognized as
+    /// provider-hosted tool output. The raw JSON payload is preserved.
+    Unknown(Value),
+}
+
+impl Serialize for Output {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Message(message) => serialize_tagged_output("message", message, serializer),
+            Self::FunctionCall(function_call) => {
+                serialize_tagged_output("function_call", function_call, serializer)
+            }
+            Self::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+                status,
+            } => {
+                let mut map = Map::new();
+                map.insert("type".to_string(), Value::String("reasoning".to_string()));
+                map.insert("id".to_string(), Value::String(id.clone()));
+                map.insert(
+                    "summary".to_string(),
+                    serde_json::to_value(summary).map_err(serde::ser::Error::custom)?,
+                );
+                if let Some(encrypted_content) = encrypted_content {
+                    map.insert(
+                        "encrypted_content".to_string(),
+                        Value::String(encrypted_content.clone()),
+                    );
+                }
+                if let Some(status) = status {
+                    map.insert(
+                        "status".to_string(),
+                        serde_json::to_value(status).map_err(serde::ser::Error::custom)?,
+                    );
+                }
+                Value::Object(map).serialize(serializer)
+            }
+            Self::ProviderHostedTool(output) => output.raw.serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+fn serialize_tagged_output<T, S>(r#type: &str, value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize,
+    S: Serializer,
+{
+    let mut value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| serde::ser::Error::custom("output item must serialize to an object"))?;
+    map.insert("type".to_string(), Value::String(r#type.to_string()));
+    value.serialize(serializer)
+}
+
+impl<'de> Deserialize<'de> for Output {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(r#type) = value
+            .get("type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            return Ok(Self::Unknown(value));
+        };
+
+        match r#type.as_str() {
+            "message" => serde_json::from_value(value)
+                .map(Self::Message)
+                .map_err(serde::de::Error::custom),
+            "function_call" => serde_json::from_value(value)
+                .map(Self::FunctionCall)
+                .map_err(serde::de::Error::custom),
+            "reasoning" => {
+                #[derive(Deserialize)]
+                struct ReasoningOutput {
+                    id: String,
+                    summary: Vec<ReasoningSummary>,
+                    #[serde(default)]
+                    encrypted_content: Option<String>,
+                    #[serde(default)]
+                    status: Option<ToolStatus>,
+                }
+
+                let reasoning = serde_json::from_value::<ReasoningOutput>(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Reasoning {
+                    id: reasoning.id,
+                    summary: reasoning.summary,
+                    encrypted_content: reasoning.encrypted_content,
+                    status: reasoning.status,
+                })
+            }
+            _ if is_provider_hosted_tool_output_type(&r#type) => Ok(Self::ProviderHostedTool(
+                ProviderHostedToolOutput::from_raw(r#type, value),
+            )),
+            _ => Ok(Self::Unknown(value)),
+        }
+    }
 }
 
 impl From<Output> for Vec<completion::AssistantContent> {
@@ -1339,7 +1476,7 @@ impl From<Output> for Vec<completion::AssistantContent> {
                     },
                 )]
             }
-            Output::Unknown => Vec::new(),
+            Output::ProviderHostedTool(_) | Output::Unknown(_) => Vec::new(),
         };
 
         res
@@ -1943,6 +2080,96 @@ mod tests {
             "output": [],
             "service_tier": service_tier,
         })
+    }
+
+    fn response_with_output(output: Vec<Value>) -> Value {
+        json!({
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 0,
+            "status": "completed",
+            "model": "gpt-5.4",
+            "output": output,
+        })
+    }
+
+    #[test]
+    fn completion_response_preserves_hosted_tool_output_payload() {
+        let web_search_call = json!({
+            "type": "web_search_call",
+            "id": "ws_123",
+            "status": "completed",
+            "queries": ["rust async streams"],
+            "results": [{
+                "title": "Rust",
+                "url": "https://www.rust-lang.org/"
+            }]
+        });
+
+        let response: CompletionResponse = serde_json::from_value(response_with_output(vec![
+            json!({
+                "type": "message",
+                "id": "msg_123",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "I found one source."
+                }]
+            }),
+            web_search_call.clone(),
+        ]))
+        .expect("response should deserialize");
+
+        let Some(Output::ProviderHostedTool(output)) = response.output.get(1) else {
+            panic!("expected provider-hosted tool output");
+        };
+
+        assert_eq!(output.id.as_deref(), Some("ws_123"));
+        assert_eq!(output.r#type, "web_search_call");
+        assert_eq!(output.status.as_deref(), Some("completed"));
+        assert_eq!(output.raw, web_search_call);
+
+        let content = response
+            .output
+            .iter()
+            .cloned()
+            .flat_map(<Vec<completion::AssistantContent>>::from)
+            .collect::<Vec<_>>();
+
+        assert_eq!(content.len(), 1);
+        assert!(matches!(
+            &content[0],
+            completion::AssistantContent::Text(text) if text.text == "I found one source."
+        ));
+
+        let converted = completion::CompletionResponse::try_from(response)
+            .expect("response should convert to Rig completion response");
+        assert!(matches!(
+            converted.raw_response.output.get(1),
+            Some(Output::ProviderHostedTool(output))
+                if output.raw["results"][0]["url"] == "https://www.rust-lang.org/"
+        ));
+    }
+
+    #[test]
+    fn completion_response_preserves_unknown_output_payload() {
+        let unknown_output = json!({
+            "type": "future_provider_output",
+            "id": "future_123",
+            "payload": {
+                "opaque": true
+            }
+        });
+
+        let response: CompletionResponse =
+            serde_json::from_value(response_with_output(vec![unknown_output.clone()]))
+                .expect("response should deserialize");
+
+        assert!(matches!(
+            response.output.first(),
+            Some(Output::Unknown(raw)) if raw == &unknown_output
+        ));
     }
 
     #[test]
